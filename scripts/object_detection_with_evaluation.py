@@ -487,7 +487,7 @@ def main():
 
             # ----------使用 ObjectDetection 模型进行前向传播 ------------
             with torch.no_grad():
-                pred_result = operation.forward(x_samples_ddim[0].unsqueeze(0))  # 返回的是 list，取第一个结果
+                pred_result = operation.operation_func.forward(x_samples_ddim[0].unsqueeze(0))  # 返回的是 list，取第一个结果
                 pred = pred_result[0]
 
             # ------------计算metric------------------------------------

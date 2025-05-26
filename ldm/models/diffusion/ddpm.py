@@ -7,6 +7,7 @@ https://github.com/CompVis/taming-transformers
 """
 
 import torch
+import torch as th
 import torch.nn as nn
 import numpy as np
 import pytorch_lightning as pl
@@ -24,7 +25,9 @@ from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianD
 from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
-
+from torchvision import transforms, utils
+import GPUtil
+from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
@@ -218,6 +221,12 @@ class DDPM(pl.LightningModule):
                 extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
                 extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
+
+    def predict_noise_from_xstart(self, x_t, t, pred_xstart):
+        return (
+            extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+            - pred_xstart
+        ) / extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
 
     def q_posterior(self, x_start, x_t, t):
         posterior_mean = (
@@ -650,6 +659,461 @@ class LatentDiffusion(DDPM):
 
         return fold, unfold, normalization, weighting
 
+
+    def operation_diffusion(self, og_img, operated_image, cond, operation, return_first_stage_outputs=False,
+                            force_c_encode=False,
+                            cond_key=None, return_original_cond=False, bs=None):
+
+        og_img = og_img.to(self.device)
+        device = self.betas.device
+
+        b = og_img.shape[0]
+
+        # get z
+        encoder_posterior = self.encode_first_stage(og_img)
+        z = self.get_first_stage_encoding(encoder_posterior).detach()
+        z = torch.randn_like(z)
+        #######
+
+        verbose = True
+        timesteps = self.num_timesteps
+        iterator = tqdm(reversed(range(0, timesteps)), desc='Sampling t', total=timesteps) if verbose else reversed(
+            range(0, timesteps))
+
+
+        for param in self.first_stage_model.parameters():
+            param.requires_grad = False
+
+        for i in iterator:
+            ts = torch.full((b,), i, device=device, dtype=torch.long)
+            ts_1 = torch.full((b,), i - 1, device=device, dtype=torch.long)
+            # start with z that is z_t
+
+            num_step_length = len(operation.num_steps)
+            index = int(num_step_length * (ts[0] / self.num_timesteps))
+            num_steps = operation.num_steps[index]
+
+            loss = None
+            _ = None
+
+            for j in range(num_steps):
+
+                # print(GPUtil.showUtilization())
+
+                operation_func = operation.operation_func
+                other_guidance_func = operation.other_guidance_func
+                criterion = operation.loss_func
+                other_criterion = operation.other_criterion
+                max_iters = operation.max_iters
+                loss_cutoff = operation.loss_cutoff
+
+                # G3
+                if operation.guidance_3:
+
+                    torch.set_grad_enabled(True)
+                    z_in = z.detach().requires_grad_(True)
+                    model_output = self.apply_model(z_in, ts, cond)
+                    z_recon = self.predict_start_from_noise(z_in, t=ts, noise=model_output)
+                    recons_image = self.decode_first_stage_with_grad(z_recon)
+
+                    if operation.print:
+                        if i % operation.print_every == 0 and j == 0:
+                            temp = (recons_image + 1) * 0.5
+                            utils.save_image(temp, f'{operation.folder}/original_guidance_{i}.png')
+
+                    if other_guidance_func != None:
+                        op_im = other_guidance_func(recons_image)
+                    elif operation_func != None:
+                        op_im = operation_func(recons_image)
+                    else:
+                        op_im = recons_image
+
+                    if other_criterion != None:
+                        selected = -1 * other_criterion(op_im, operated_image)
+                    else:
+                        selected = -1 * criterion(op_im, operated_image)
+
+
+                    print(ts)
+                    print(selected)
+
+                    grad = th.autograd.grad(selected.sum(), z_in)[0]
+                    grad = grad * operation.optim_guidance_3_wt
+
+                    alpha_bar = extract_into_tensor(self.alphas_cumprod, ts, z.shape)
+
+                    eps = model_output
+                    eps = eps - (1 - alpha_bar).sqrt() * grad
+
+                    del z_in
+                    del selected
+
+                    torch.set_grad_enabled(False)
+                    z_recon = self.predict_start_from_noise(z, t=ts, noise=eps)
+                    recons_image = self.decode_first_stage(z_recon)
+
+                    if operation.print:
+                        if i % operation.print_every == 0 and j == 0:
+                            temp = (recons_image + 1) * 0.5
+                            utils.save_image(temp, f'{operation.folder}/guidance_3_{i}.png')
+
+
+                else:
+                    model_output = self.apply_model(z, ts, cond)
+                    z_recon = self.predict_start_from_noise(z, t=ts, noise=model_output)
+                    recons_image = self.decode_first_stage_with_grad(z_recon)
+
+                    torch.set_grad_enabled(False)
+
+                    if operation.print:
+                        if i % operation.print_every == 0 and j == 0:
+                            temp = (recons_image + 1) * 0.5
+                            utils.save_image(temp, f'{operation.folder}/original_guidance_{i}.png')
+
+                # change the recons image
+                # G2 guidance
+                # you have recons_image so optimize it
+
+                if operation.guidance_2:
+
+                    torch.set_grad_enabled(True)
+                    recons_image = recons_image.detach().requires_grad_(True)
+
+                    if operation.optimizer == 'Adam':
+                        lr = operation.lr
+                        optimizer = torch.optim.Adam([recons_image], lr=lr)
+
+                    if operation.lr_scheduler == 'CosineAnnealingLR':
+                        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max_iters)
+
+                    weights = torch.ones_like(recons_image).cuda()
+                    ones = torch.ones_like(recons_image).cuda()
+                    zeros = torch.zeros_like(recons_image).cuda()
+
+                    for _ in range(max_iters):
+                        with torch.no_grad():
+                            recons_image.clamp_(-1, 1)
+
+                        optimizer.zero_grad()
+                        if operation_func != None:
+                            op_im = operation_func(recons_image)
+                        else:
+                            op_im = recons_image
+
+                        loss = criterion(op_im, operated_image)
+
+                        for __ in range(loss.shape[0]):
+                            if loss[__] < loss_cutoff:
+                                weights[__] = zeros[__]
+                            else:
+                                weights[__] = ones[__]
+
+                        before_x = torch.clone(recons_image.data)
+
+                        m_loss = loss.sum()
+                        m_loss.backward()
+                        optimizer.step()
+
+                        if operation.lr_scheduler != None:
+                            scheduler.step()
+
+                        with torch.no_grad():
+                            recons_image.data = before_x * (1 - weights) + weights * recons_image.data
+
+                        if weights.sum() == 0:
+                            break
+
+                    recons_image.requires_grad = False
+                    torch.set_grad_enabled(False)
+
+                    recons_image = torch.clamp(recons_image, -1, 1)
+
+                    encoder_posterior = self.encode_first_stage(recons_image)
+                    z_recon = self.get_first_stage_encoding(encoder_posterior).detach()
+                    print("G2 loss ", loss)
+
+                    recons_image = self.decode_first_stage(z_recon)
+                    if operation.print:
+                        if i % operation.print_every == 0 and j == 0:
+                            temp = (recons_image + 1) * 0.5
+                            utils.save_image(temp, f'{operation.folder}/guidance_2_{i}.png')
+
+
+
+                z_epsilon = self.predict_noise_from_xstart(z, ts, z_recon)
+
+                if i != 0:
+                    coeff1 = extract_into_tensor(self.sqrt_alphas_cumprod, ts_1, z.shape)
+                    coeff2 = extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, ts_1, z.shape)
+                    if operation.ddpm:
+                        z_prev = z_recon * coeff1 + z_epsilon * coeff2
+                    else:
+                        z_prev = z_recon * coeff1 + z_epsilon * coeff2
+                else:
+                    z_prev = z_recon
+
+                ## take one more step
+                coeff1 = torch.sqrt(1 - extract_into_tensor(self.betas, ts, z.shape))
+                coeff2 = torch.sqrt(extract_into_tensor(self.betas, ts, z.shape))
+                z = coeff1 * z_prev + coeff2 * torch.randn_like(z)
+
+        recons_image = self.decode_first_stage(z_prev)
+        return recons_image
+
+
+
+
+
+    def register_buffer_ddim(self, name, attr):
+        if type(attr) == torch.Tensor:
+            if attr.device != torch.device("cuda"):
+                attr = attr.to(torch.device("cuda"))
+        setattr(self, name, attr)
+
+
+    def make_schedule_ddim(self, ddim_num_steps, ddim_discretize="uniform", ddim_eta=0., verbose=True):
+
+        self.ddim_timesteps = make_ddim_timesteps(ddim_discr_method=ddim_discretize, num_ddim_timesteps=ddim_num_steps,
+                                                  num_ddpm_timesteps=self.num_timesteps, verbose=verbose)
+
+        alphas_cumprod = self.alphas_cumprod
+        to_torch = lambda x: x.clone().detach().to(torch.float32).to(self.device)
+
+        self.register_buffer_ddim('betas', to_torch(self.betas))
+        self.register_buffer_ddim('alphas_cumprod', to_torch(alphas_cumprod))
+        self.register_buffer_ddim('alphas_cumprod_prev', to_torch(self.alphas_cumprod_prev))
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+        self.register_buffer_ddim('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod.cpu())))
+        self.register_buffer_ddim('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod.cpu())))
+        self.register_buffer_ddim('log_one_minus_alphas_cumprod', to_torch(np.log(1. - alphas_cumprod.cpu())))
+        self.register_buffer_ddim('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod.cpu())))
+        self.register_buffer_ddim('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod.cpu() - 1)))
+
+        # ddim sampling parameters
+        ddim_sigmas, ddim_alphas, ddim_alphas_prev = make_ddim_sampling_parameters(alphacums=alphas_cumprod.cpu(),
+                                                                                   ddim_timesteps=self.ddim_timesteps,
+                                                                                   eta=ddim_eta, verbose=verbose)
+        self.register_buffer_ddim('ddim_sigmas', ddim_sigmas)
+        self.register_buffer_ddim('ddim_alphas', ddim_alphas)
+        self.register_buffer_ddim('ddim_alphas_prev', ddim_alphas_prev)
+        self.register_buffer_ddim('ddim_sqrt_one_minus_alphas', np.sqrt(1. - ddim_alphas))
+        sigmas_for_original_sampling_steps = ddim_eta * torch.sqrt(
+            (1 - self.alphas_cumprod_prev) / (1 - self.alphas_cumprod) * (
+                    1 - self.alphas_cumprod / self.alphas_cumprod_prev))
+        self.register_buffer_ddim('ddim_sigmas_for_original_num_steps', sigmas_for_original_sampling_steps)
+
+
+
+    def operation_diffusion_ddim(self, S,
+               batch_size,
+               shape,
+               operated_image=None,
+               operation=None,
+               conditioning=None,
+               eta=0.,
+               temperature=1.,
+               verbose=True,
+               unconditional_guidance_scale=1.,
+               unconditional_conditioning=None):
+
+        self.make_schedule_ddim(ddim_num_steps=S, ddim_eta=eta, verbose=verbose)
+        # sampling
+        C, H, W = shape
+        shape = (batch_size, C, H, W)
+        cond = conditioning
+
+        device = self.device
+        b = shape[0]
+
+        # get z
+        z = torch.randn(shape, device=device)
+        #######
+
+
+        timesteps = self.ddim_timesteps
+        time_range = np.flip(timesteps)
+        total_steps = timesteps.shape[0]
+
+        iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+
+        alphas = self.ddim_alphas
+        alphas_prev = self.ddim_alphas_prev
+        sqrt_one_minus_alphas = self.ddim_sqrt_one_minus_alphas
+        sigmas = self.ddim_sigmas
+
+        for param in self.first_stage_model.parameters():
+            param.requires_grad = False
+
+        for i, step in enumerate(iterator):
+            index = total_steps - i - 1
+            ts = torch.full((b,), step, device=device, dtype=torch.long)
+
+            a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
+            a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
+            sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
+            sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index], device=device)
+
+            beta_t = a_t / a_prev
+
+            num_steps = operation.num_steps[0]
+            operation_func = operation.operation_func
+            other_guidance_func = operation.other_guidance_func
+            criterion = operation.loss_func
+            other_criterion = operation.other_criterion
+            max_iters = operation.max_iters
+            loss_cutoff = operation.loss_cutoff
+
+            loss = None
+            _ = None
+
+            for j in range(num_steps):
+
+                if operation.guidance_3:
+
+                    torch.set_grad_enabled(True)
+                    z_in = z.detach().requires_grad_(True)
+                    model_output = self.apply_model(z_in, ts, cond)
+                    z_recon = (z_in - sqrt_one_minus_at * model_output) / a_t.sqrt() #self.predict_start_from_noise(z_in, t=ts, noise=model_output)
+                    recons_image = self.decode_first_stage_with_grad(z_recon)
+
+                    if operation.print:
+                        if i % operation.print_every == 0 and j == 0:
+                            temp = (recons_image + 1) * 0.5
+                            utils.save_image(temp, f'{operation.folder}/original_guidance_{i}.png')
+
+                    if other_guidance_func != None:
+                        op_im = other_guidance_func(recons_image)
+                    elif operation_func != None:
+                        op_im = operation_func(recons_image)
+                    else:
+                        op_im = recons_image
+
+                    if other_criterion != None:
+                        selected = -1 * other_criterion(op_im, operated_image)
+                    else:
+                        selected = -1 * criterion(op_im, operated_image)
+
+
+                    print(ts)
+                    print(selected)
+
+                    grad = th.autograd.grad(selected.sum(), z_in)[0]
+                    grad = grad * operation.optim_guidance_3_wt
+
+                    eps = model_output
+                    eps = eps - sqrt_one_minus_at * grad
+
+                    del z_in
+                    del selected
+
+                    torch.set_grad_enabled(False)
+                    z_recon = (z - sqrt_one_minus_at * eps) / a_t.sqrt() #self.predict_start_from_noise(z, t=ts, noise=eps)
+                    recons_image = self.decode_first_stage(z_recon)
+
+                    if operation.print:
+                        if i % operation.print_every == 0 and j == 0:
+                            temp = (recons_image + 1) * 0.5
+                            utils.save_image(temp, f'{operation.folder}/guidance_3_{i}.png')
+
+
+                else:
+                    model_output = self.apply_model(z, ts, cond)
+                    z_recon = (z - sqrt_one_minus_at * model_output) / a_t.sqrt() #self.predict_start_from_noise(z, t=ts, noise=model_output)
+                    recons_image = self.decode_first_stage_with_grad(z_recon)
+
+                    torch.set_grad_enabled(False)
+
+                    if operation.print:
+                        if i % operation.print_every == 0 and j == 0:
+                            temp = (recons_image + 1) * 0.5
+                            utils.save_image(temp, f'{operation.folder}/original_guidance_{i}.png')
+
+                # change the recons image
+                # G2 guidance
+                # you have recons_image so optimize it
+
+                if operation.guidance_2:
+
+                    torch.set_grad_enabled(True)
+                    recons_image = recons_image.detach().requires_grad_(True)
+
+                    if operation.optimizer == 'Adam':
+                        lr = operation.lr
+                        optimizer = torch.optim.Adam([recons_image], lr=lr)
+
+                    if operation.lr_scheduler == 'CosineAnnealingLR':
+                        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max_iters)
+
+                    weights = torch.ones_like(recons_image).cuda()
+                    ones = torch.ones_like(recons_image).cuda()
+                    zeros = torch.zeros_like(recons_image).cuda()
+
+                    for _ in range(max_iters):
+                        with torch.no_grad():
+                            recons_image.clamp_(-1, 1)
+
+                        optimizer.zero_grad()
+                        if operation_func != None:
+                            op_im = operation_func(recons_image)
+                        else:
+                            op_im = recons_image
+
+                        loss = criterion(op_im, operated_image)
+
+                        for __ in range(loss.shape[0]):
+                            if loss[__] < loss_cutoff:
+                                weights[__] = zeros[__]
+                            else:
+                                weights[__] = ones[__]
+
+                        before_x = torch.clone(recons_image.data)
+
+                        m_loss = loss.sum()
+                        m_loss.backward()
+                        optimizer.step()
+
+                        if operation.lr_scheduler != None:
+                            scheduler.step()
+
+                        with torch.no_grad():
+                            recons_image.data = before_x * (1 - weights) + weights * recons_image.data
+
+                        if weights.sum() == 0:
+                            break
+
+                    recons_image.requires_grad = False
+                    torch.set_grad_enabled(False)
+
+                    recons_image = torch.clamp(recons_image, -1, 1)
+
+                    encoder_posterior = self.encode_first_stage(recons_image)
+                    z_recon = self.get_first_stage_encoding(encoder_posterior).detach()
+                    print("G2 loss ", loss)
+
+                    recons_image = self.decode_first_stage(z_recon)
+                    if operation.print:
+                        if i % operation.print_every == 0 and j == 0:
+                            temp = (recons_image + 1) * 0.5
+                            utils.save_image(temp, f'{operation.folder}/guidance_2_{i}.png')
+
+
+                z_epsilon = (z - a_t.sqrt() * z_recon) / sqrt_one_minus_at
+
+                if i != 0:
+                    dir_xt = (1. - a_prev - sigma_t ** 2).sqrt() * z_epsilon
+                    noise = sigma_t * noise_like(z.shape, device, False) * temperature
+
+                    z_prev = a_prev.sqrt() * z_recon + dir_xt + noise
+                    z = beta_t.sqrt() * z_prev + (1 - beta_t).sqrt() * noise_like(z.shape, device, False)
+                else:
+                    z_prev = z_recon
+                    z = z_prev
+
+        recons_image = self.decode_first_stage(z_prev)
+        return recons_image
+
+
     @torch.no_grad()
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
                   cond_key=None, return_original_cond=False, bs=None):
@@ -757,9 +1221,75 @@ class LatentDiffusion(DDPM):
                     return self.first_stage_model.decode(z)
 
         else:
+            # print("########## 2.0")
             if isinstance(self.first_stage_model, VQModelInterface):
+                # print("########## 2.1")
                 return self.first_stage_model.decode(z, force_not_quantize=predict_cids or force_not_quantize)
             else:
+                # print("########## 2.2")
+                return self.first_stage_model.decode(z)
+
+
+    def decode_first_stage_with_grad(self, z, predict_cids=False, force_not_quantize=False):
+        if predict_cids:
+            if z.dim() == 4:
+                z = torch.argmax(z.exp(), dim=1).long()
+            z = self.first_stage_model.quantize.get_codebook_entry(z, shape=None)
+            z = rearrange(z, 'b h w c -> b c h w').contiguous()
+
+        z = 1. / self.scale_factor * z
+
+        if hasattr(self, "split_input_params"):
+            if self.split_input_params["patch_distributed_vq"]:
+                ks = self.split_input_params["ks"]  # eg. (128, 128)
+                stride = self.split_input_params["stride"]  # eg. (64, 64)
+                uf = self.split_input_params["vqf"]
+                bs, nc, h, w = z.shape
+                if ks[0] > h or ks[1] > w:
+                    ks = (min(ks[0], h), min(ks[1], w))
+                    print("reducing Kernel")
+
+                if stride[0] > h or stride[1] > w:
+                    stride = (min(stride[0], h), min(stride[1], w))
+                    print("reducing stride")
+
+                fold, unfold, normalization, weighting = self.get_fold_unfold(z, ks, stride, uf=uf)
+
+                z = unfold(z)  # (bn, nc * prod(**ks), L)
+                # 1. Reshape to img shape
+                z = z.view((z.shape[0], -1, ks[0], ks[1], z.shape[-1]))  # (bn, nc, ks[0], ks[1], L )
+
+                # 2. apply model loop over last dim
+                if isinstance(self.first_stage_model, VQModelInterface):
+                    output_list = [self.first_stage_model.decode(z[:, :, :, :, i],
+                                                                 force_not_quantize=predict_cids or force_not_quantize)
+                                   for i in range(z.shape[-1])]
+                else:
+
+                    output_list = [self.first_stage_model.decode(z[:, :, :, :, i])
+                                   for i in range(z.shape[-1])]
+
+                o = torch.stack(output_list, axis=-1)  # # (bn, nc, ks[0], ks[1], L)
+                o = o * weighting
+                # Reverse 1. reshape to img shape
+                o = o.view((o.shape[0], -1, o.shape[-1]))  # (bn, nc * ks[0] * ks[1], L)
+                # stitch crops together
+                decoded = fold(o)
+                decoded = decoded / normalization  # norm is shape (1, 1, h, w)
+                return decoded
+            else:
+                if isinstance(self.first_stage_model, VQModelInterface):
+                    return self.first_stage_model.decode(z, force_not_quantize=predict_cids or force_not_quantize)
+                else:
+                    return self.first_stage_model.decode(z)
+
+        else:
+            # print("########## 2.0")
+            if isinstance(self.first_stage_model, VQModelInterface):
+                # print("########## 2.1")
+                return self.first_stage_model.decode(z, force_not_quantize=predict_cids or force_not_quantize)
+            else:
+                # print("########## 2.2")
                 return self.first_stage_model.decode(z)
 
     # same as above but without decorator

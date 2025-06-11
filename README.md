@@ -53,7 +53,7 @@ python scripts/object_detection_with_evaluation.py \
   --optim_original_conditioning \
   --ddim_steps 50 \
   --optim_folder ./test_od/ \
-  --ckpt /content/drive/MyDrive/sd-v1-4.ckpt \
+  --ckpt /path/to/model.ckpt \
   --trials 3
 ```
 
